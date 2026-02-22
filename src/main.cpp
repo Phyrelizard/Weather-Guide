@@ -1,8 +1,9 @@
 #include <Arduino.h>
 
 /**
+ * v2.0.8 - increasd vertical resolution for serial output
  * v2.0.7 - gave up on have seconds display updating correctly , just hours and minutes
- * v.2.0.6 - permanently assign x values for the clock so it sits still
+ * v2.0.6 - permanently assign x values for the clock so it sits still
  * v2.0.5 - make clock stationary, fix serial output scrolling, title font size larger
  * v2.0.4 - make clock on one line, bigger serial font,
  * v2.0.3 - fix backlight not turning on after reboot
@@ -36,7 +37,7 @@
 #include <nvs_flash.h>
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.0.7"
+#define FIRMWARE_VERSION "v2.0.8"
 
 // mDNS hostname
 const char* mdnsName = "weatherguide";
@@ -826,7 +827,7 @@ void createUI() {
     lv_obj_set_style_text_color(serial_output, lv_color_hex(0x00FF00), LV_PART_MAIN);
     lv_label_set_long_mode(serial_output, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(serial_output, 780);
-    lv_obj_set_height(serial_output, 360);  // Reduced height so it doesn't cut off
+    lv_obj_set_height(serial_output, 440);  // Reduced height so it doesn't cut off
     lv_obj_align(serial_output, LV_ALIGN_TOP_LEFT, 10, 45);
     lv_label_set_text(serial_output, "Serial Output:\n");
     
