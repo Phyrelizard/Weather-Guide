@@ -1,8 +1,9 @@
 #include <Arduino.h>
 // Firmware version
-#define FIRMWARE_VERSION "v2.1.1"
+#define FIRMWARE_VERSION "v2.1.2"
 /**
- * v2.1.1 - Minor bug fixes and improvements - added weather icons
+ *  v2.1.2 - adjustments to gui layout and fonts, added more weather details to main screen, added precipitation % to forecast panels
+ *  v2.1.1 - Minor bug fixes and improvements - added weather icons
  * 
  * v2.1.0 - OpenWeatherMap integration with current weather and 5-day forecast
  * v2.0.7 - gave up on have seconds display updating correctly, just hours and minutes
@@ -957,7 +958,7 @@ void createWeatherUI() {
     
     // ===== LEFT SECTION: Current Weather Icon =====
     main_icon_label = lv_label_create(weather_container);
-    lv_obj_set_style_text_font(main_icon_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_font(main_icon_label, &lv_font_montserrat_44, 0);
     lv_obj_set_style_text_color(main_icon_label, lv_color_hex(0xFFD700), 0);
     lv_obj_set_style_text_align(main_icon_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_size(main_icon_label, 150, 100);
@@ -975,7 +976,7 @@ void createWeatherUI() {
     
     // Feels like
     feels_like_label = lv_label_create(weather_container);
-    lv_obj_set_style_text_font(feels_like_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(feels_like_label, &lv_font_montserrat_22, 0);
     lv_obj_set_style_text_color(feels_like_label, lv_color_hex(0xAAAAAA), 0);
     lv_obj_align(feels_like_label, LV_ALIGN_TOP_MID, 0, 70);
     lv_label_set_text(feels_like_label, "Feels like --°");
@@ -989,7 +990,7 @@ void createWeatherUI() {
     
     // Location
     location_label = lv_label_create(weather_container);
-    lv_obj_set_style_text_font(location_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(location_label, &lv_font_montserrat_22, 0);
     lv_obj_set_style_text_color(location_label, lv_color_hex(0x888888), 0);
     lv_obj_align(location_label, LV_ALIGN_TOP_MID, 0, 130);
     lv_label_set_text(location_label, "---");
@@ -1046,7 +1047,7 @@ void createWeatherUI() {
         
         // Day name
         lv_obj_t *day_lbl = lv_label_create(panel);
-        lv_obj_set_style_text_font(day_lbl, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_font(day_lbl, &lv_font_montserrat_24, 0);
         lv_obj_set_style_text_color(day_lbl, lv_color_hex(0x00FFFF), 0);
         lv_obj_align(day_lbl, LV_ALIGN_TOP_MID, 0, 5);
         lv_label_set_text(day_lbl, "---");
@@ -1071,7 +1072,7 @@ void createWeatherUI() {
         
         // Low temp
         lv_obj_t *low_lbl = lv_label_create(panel);
-        lv_obj_set_style_text_font(low_lbl, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_font(low_lbl, &lv_font_montserrat_24, 0);
         lv_obj_set_style_text_color(low_lbl, lv_color_hex(0x6699FF), 0);
         lv_obj_align(low_lbl, LV_ALIGN_CENTER, 0, 45);
         lv_label_set_text(low_lbl, "--°");
@@ -1079,9 +1080,9 @@ void createWeatherUI() {
         
         // Precipitation %
         lv_obj_t *pop_lbl = lv_label_create(panel);
-        lv_obj_set_style_text_font(pop_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_font(pop_lbl, &lv_font_montserrat_24, 0);
         lv_obj_set_style_text_color(pop_lbl, lv_color_hex(0x66CCFF), 0);
-        lv_obj_align(pop_lbl, LV_ALIGN_BOTTOM_MID, 0, -10);
+        lv_obj_align(pop_lbl, LV_ALIGN_BOTTOM_MID, 0, 10);
         lv_label_set_text(pop_lbl, "-- %");
         forecast_pop_labels[i] = pop_lbl;
     }
