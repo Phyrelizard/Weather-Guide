@@ -1,7 +1,12 @@
 #include <Arduino.h>
+#include <math.h>
 // Firmware version
-#define FIRMWARE_VERSION "v2.1.2"
+#define FIRMWARE_VERSION "v2.2.3"
 /**
+ *  v2.2.3 - rain animation drop overlays auto-center to rain icon width (works better with smaller rain.c assets)
+ *  v2.2.2 - OTA update prep now turns backlight OFF after splash/blackout to eliminate visible flicker during upload
+ *  v2.2.1 - animated rain icon overlays + forecast daily high/low aggregation fix
+ *  v2.2.0 - OTA pre-upload splash/blackout screen + boot continue countdown auto-advance
  *  v2.1.2 - adjustments to gui layout and fonts, added more weather details to main screen, added precipitation % to forecast panels
  *  v2.1.1 - Minor bug fixes and improvements - added weather icons
  * 
@@ -17,7 +22,7 @@
  * - Displays clock in upper right corner
  * - OpenWeatherMap current weather and 5-day forecast
  * - Full screen weather display with icons
- * 
+ *cd 
  * First boot: Connect to "WeatherGuide_Setup" network to configure WiFi
  * Configure weather at http://weatherguide.local/weather
  */
@@ -37,9 +42,12 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 
-// Weather icons (will use text fallback until real icons are added)
-// #include "weather_icons.h"  // Uncomment when you have real icons
+// Weather icons (LVGL C-array images)
+#include "weather_icons.h"
 
+// Icon scaling (256 = 1.0x). Adjust if your icon bitmaps are large.
+#define MAIN_ICON_ZOOM     256   // Current conditions icon
+#define FORECAST_ICON_ZOOM 192   // 80px -> ~60px
 
 
 // mDNS hostname
@@ -106,10 +114,16 @@ static lv_obj_t *backlight_btn = NULL;
 // UI elements - Setup screen
 static lv_obj_t *serial_output = NULL;
 static lv_obj_t *continue_btn = NULL;
+static lv_obj_t *continue_countdown_label = NULL;
+
+// OTA overlay
+static lv_obj_t *ota_overlay = NULL;
+static lv_obj_t *ota_label = NULL;
+static lv_obj_t *ota_sub_label = NULL;
 
 // UI elements - Weather screen
 static lv_obj_t *weather_container = NULL;
-static lv_obj_t *main_icon_label = NULL;      // Large weather icon/text for current
+static lv_obj_t *main_icon_img = NULL;        // Large weather icon image for current
 static lv_obj_t *temp_label = NULL;           // Large temperature
 static lv_obj_t *feels_like_label = NULL;
 static lv_obj_t *condition_label = NULL;
@@ -122,10 +136,27 @@ static lv_obj_t *last_update_label = NULL;
 // Forecast panels and their children
 static lv_obj_t *forecast_panels[5] = {NULL};
 static lv_obj_t *forecast_day_labels[5] = {NULL};
-static lv_obj_t *forecast_icon_labels[5] = {NULL};
+static lv_obj_t *forecast_icon_imgs[5] = {NULL};
 static lv_obj_t *forecast_high_labels[5] = {NULL};
 static lv_obj_t *forecast_low_labels[5] = {NULL};
 static lv_obj_t *forecast_pop_labels[5] = {NULL};
+
+// Animated rain overlays (drawn on top of rain icons)
+#define MAIN_RAIN_DROP_COUNT 6
+#define FORECAST_RAIN_DROP_COUNT 4
+static lv_obj_t *main_rain_overlay = NULL;
+static lv_obj_t *main_rain_drops[MAIN_RAIN_DROP_COUNT] = {NULL};
+static lv_point_t main_rain_drop_points[MAIN_RAIN_DROP_COUNT][2];
+static lv_obj_t *forecast_rain_overlays[5] = {NULL};
+static lv_obj_t *forecast_rain_drops[5][FORECAST_RAIN_DROP_COUNT] = {{NULL}};
+static lv_point_t forecast_rain_drop_points[5][FORECAST_RAIN_DROP_COUNT][2];
+static bool g_mainRainActive = false;
+static bool g_forecastRainActive[5] = {false, false, false, false, false};
+static uint8_t g_rainAnimPhase = 0;
+static unsigned long g_lastRainAnimTick = 0;
+// Rain drop alignment nudges (fine tune if you swap icon art again)
+static const int MAIN_RAIN_DROP_X_NUDGE = -18; //prev was -4
+static const int FORECAST_RAIN_DROP_X_NUDGE = -18; //was -6
 
 // UI state
 enum UIState {
@@ -148,6 +179,17 @@ int currentLine = 0;
 static unsigned long lastUpdate = 0;
 const unsigned long UPDATE_INTERVAL_MS = 1000;
 bool g_rebootRequired = false;
+
+// Boot continue auto-advance countdown
+bool g_continueCountdownActive = false;
+int g_continueCountdownSeconds = 10;
+unsigned long g_lastContinueCountdownTick = 0;
+
+// OTA display freeze / blackout
+bool g_otaDisplayFreeze = false;
+bool g_otaUploadStarted = false;
+bool g_otaBacklightWasOff = false;
+bool g_otaBacklightForcedOff = false;
 
 // Extend IO Pin define
 #define TP_RST 1
@@ -172,6 +214,10 @@ bool g_rebootRequired = false;
 ESP_Panel *panel = NULL;
 SemaphoreHandle_t lvgl_mux = NULL;
 
+// Forward declare LVGL lock helpers used by weather animation helpers
+void lvgl_port_lock(int timeout_ms);
+void lvgl_port_unlock(void);
+
 // ============== WEATHER ICON HELPERS ==============
 
 // Get weather icon text (emoji-style text representation)
@@ -186,6 +232,145 @@ const char* getWeatherIconText(String iconCode) {
     if (iconCode.startsWith("13")) return "SNOW";
     if (iconCode.startsWith("50")) return "FOGGY";
     return "---";
+}
+
+
+// Get LVGL image descriptor for the OpenWeather icon code (e.g. "01d", "10n")
+const lv_img_dsc_t* getWeatherIconDsc(const String& iconCode) {
+    if (iconCode.startsWith("01")) return &sunny;
+    if (iconCode.startsWith("02")) return &partly_cloudy;
+    if (iconCode.startsWith("03")) return &cloudy;
+    if (iconCode.startsWith("04")) return &cloudy;
+    if (iconCode.startsWith("09")) return &rain;
+    if (iconCode.startsWith("10")) return &rain;
+    if (iconCode.startsWith("11")) return &storm;
+    if (iconCode.startsWith("13")) return &snow;
+    if (iconCode.startsWith("50")) return &fog;
+    return NULL;
+}
+
+bool isRainIconCode(const String& iconCode) {
+    return iconCode.startsWith("09") || iconCode.startsWith("10");
+}
+
+void createRainOverlay(lv_obj_t* parent, lv_obj_t** overlayOut, lv_obj_t** drops, int dropCount, uint16_t w, uint16_t h, uint8_t lineWidth) {
+    if (!parent || !overlayOut) return;
+
+    lv_obj_t* overlay = lv_obj_create(parent);
+    lv_obj_set_size(overlay, w, h);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(overlay, 0, 0);
+    lv_obj_set_style_pad_left(overlay, 0, 0);
+    lv_obj_set_style_pad_right(overlay, 0, 0);
+    lv_obj_set_style_pad_top(overlay, 0, 0);
+    lv_obj_set_style_pad_bottom(overlay, 0, 0);
+    lv_obj_set_style_radius(overlay, 0, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+    // Don't block touches on the screen
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    for (int i = 0; i < dropCount; i++) {
+        drops[i] = lv_line_create(overlay);
+        lv_obj_set_style_line_color(drops[i], lv_color_hex(0x66CCFF), 0);
+        lv_obj_set_style_line_width(drops[i], lineWidth, 0);
+        lv_obj_set_style_line_rounded(drops[i], true, 0);
+        lv_obj_add_flag(drops[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    *overlayOut = overlay;
+}
+
+void refreshRainAnimationVisibilityLocked() {
+    bool mainRain = currentWeather.valid && isRainIconCode(currentWeather.icon);
+    g_mainRainActive = mainRain;
+    if (main_rain_overlay) {
+        if (mainRain) lv_obj_clear_flag(main_rain_overlay, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(main_rain_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    for (int i = 0; i < 5; i++) {
+        bool active = (forecast[i].dt != 0) && isRainIconCode(forecast[i].icon);
+        g_forecastRainActive[i] = active;
+        if (forecast_rain_overlays[i]) {
+            if (active) lv_obj_clear_flag(forecast_rain_overlays[i], LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(forecast_rain_overlays[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+void updateRainAnimationFrameLocked() {
+    // Main 80x80 icon overlay
+    if (g_mainRainActive && main_rain_overlay) {
+    // Auto-center the drop pattern based on the actual rain icon width (helps when rain.c is smaller)
+    static const uint8_t xPct[MAIN_RAIN_DROP_COUNT] = {18, 34, 50, 66, 82, 58};
+    int overlayW = (int)lv_obj_get_width(main_rain_overlay);
+    int rainDispW = (int)((rain.header.w * (uint32_t)MAIN_ICON_ZOOM + 128U) / 256U);
+    if (rainDispW <= 0 || rainDispW > overlayW) rainDispW = overlayW;
+    int rainLeft = (overlayW - rainDispW) / 2;
+    for (int i = 0; i < MAIN_RAIN_DROP_COUNT; i++) {
+        int y = 38 + ((int)g_rainAnimPhase * 4 + i * 7) % 30;
+        int x = rainLeft + (int)((rainDispW * xPct[i]) / 100) + MAIN_RAIN_DROP_X_NUDGE;
+        if (x < 2) x = 2;
+        if (x > overlayW - 3) x = overlayW - 3;
+        main_rain_drop_points[i][0].x = x;
+
+            main_rain_drop_points[i][0].y = y;
+            main_rain_drop_points[i][1].x = x - 2;
+            main_rain_drop_points[i][1].y = y + 10;
+            if (main_rain_drops[i]) {
+                lv_line_set_points(main_rain_drops[i], main_rain_drop_points[i], 2);
+                if (((g_rainAnimPhase + i) % 5) == 0) lv_obj_add_flag(main_rain_drops[i], LV_OBJ_FLAG_HIDDEN);
+                else lv_obj_clear_flag(main_rain_drops[i], LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    } else {
+        for (int i = 0; i < MAIN_RAIN_DROP_COUNT; i++) {
+            if (main_rain_drops[i]) lv_obj_add_flag(main_rain_drops[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    // Forecast 60x60 icon overlays
+    for (int p = 0; p < 5; p++) {
+        if (g_forecastRainActive[p] && forecast_rain_overlays[p]) {
+    static const uint8_t xPctSmall[FORECAST_RAIN_DROP_COUNT] = {22, 42, 62, 80};
+    int overlayW = (int)lv_obj_get_width(forecast_rain_overlays[p]);
+    int rainDispW = (int)((rain.header.w * (uint32_t)FORECAST_ICON_ZOOM + 128U) / 256U);
+    if (rainDispW <= 0 || rainDispW > overlayW) rainDispW = overlayW;
+    int rainLeft = (overlayW - rainDispW) / 2;
+    for (int i = 0; i < FORECAST_RAIN_DROP_COUNT; i++) {
+        int y = 25 + ((int)g_rainAnimPhase * 3 + i * 5 + p) % 18;
+        int x = rainLeft + (int)((rainDispW * xPctSmall[i]) / 100) + FORECAST_RAIN_DROP_X_NUDGE;
+        if (x < 2) x = 2;
+        if (x > overlayW - 3) x = overlayW - 3;
+        forecast_rain_drop_points[p][i][0].x = x;
+
+                forecast_rain_drop_points[p][i][0].y = y;
+                forecast_rain_drop_points[p][i][1].x = x - 2;
+                forecast_rain_drop_points[p][i][1].y = y + 7;
+                if (forecast_rain_drops[p][i]) {
+                    lv_line_set_points(forecast_rain_drops[p][i], forecast_rain_drop_points[p][i], 2);
+                    if (((g_rainAnimPhase + i + p) % 4) == 0) lv_obj_add_flag(forecast_rain_drops[p][i], LV_OBJ_FLAG_HIDDEN);
+                    else lv_obj_clear_flag(forecast_rain_drops[p][i], LV_OBJ_FLAG_HIDDEN);
+                }
+            }
+        } else {
+            for (int i = 0; i < FORECAST_RAIN_DROP_COUNT; i++) {
+                if (forecast_rain_drops[p][i]) lv_obj_add_flag(forecast_rain_drops[p][i], LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
+}
+
+void tickRainAnimation(unsigned long nowMs) {
+    if (g_otaDisplayFreeze || currentUIState != UI_MAIN) return;
+    if (nowMs - g_lastRainAnimTick < 140) return;
+    g_lastRainAnimTick = nowMs;
+    g_rainAnimPhase = (uint8_t)((g_rainAnimPhase + 1) % 20);
+
+    lvgl_port_lock(-1);
+    updateRainAnimationFrameLocked();
+    lvgl_port_unlock();
 }
 
 // Get short weather text for forecast panels
@@ -386,6 +571,20 @@ String getWindDirection(int degrees) {
 
 // Forward declaration
 void updateWeatherUI();
+void updateContinueCountdownLabel();
+void beginContinueCountdown();
+void stopContinueCountdown();
+void showOTAPrepareMessageScreen();
+void showOTABlackoutScreen();
+void backlightOff();
+void backlightOn();
+void otaCutBacklightForUpdate();
+void otaRestoreBacklightAfterFailedUpdate();
+bool isRainIconCode(const String& iconCode);
+void createRainOverlay(lv_obj_t* parent, lv_obj_t** overlayOut, lv_obj_t** drops, int dropCount, uint16_t w, uint16_t h, uint8_t lineWidth);
+void refreshRainAnimationVisibilityLocked();
+void updateRainAnimationFrameLocked();
+void tickRainAnimation(unsigned long nowMs);
 
 bool fetchCurrentWeather() {
     if (WiFi.status() != WL_CONNECTED) {
@@ -461,40 +660,40 @@ bool fetchForecast() {
         DisplayLog.println("Forecast: WiFi or API missing");
         return false;
     }
-    
+
     HTTPClient http;
     WiFiClientSecure client;
     client.setInsecure();
-    
+
     String units = useMetricUnits ? "metric" : "imperial";
     String url = "https://api.openweathermap.org/data/2.5/forecast?";
     url += "lat=" + String(weatherLat, 6);
     url += "&lon=" + String(weatherLon, 6);
     url += "&appid=" + weatherApiKey;
     url += "&units=" + units;
-    
+
     DisplayLog.println("Fetching forecast...");
-    
+
     http.begin(client, url);
     http.setTimeout(15000);
     int httpCode = http.GET();
-    
+
     if (httpCode == HTTP_CODE_OK) {
         String payload = http.getString();
-        
+
         DynamicJsonDocument doc(24576);
         DeserializationError error = deserializeJson(doc, payload);
-        
+
         if (error) {
             DisplayLog.printf("Forecast JSON error: %s\n", error.c_str());
             http.end();
             return false;
         }
-        
+
         JsonArray list = doc["list"].as<JsonArray>();
         int dayIndex = 0;
-        int lastDay = -1;
-        
+        int lastDayKey = -1;
+
         // Initialize forecast array
         for (int i = 0; i < 5; i++) {
             forecast[i].dt = 0;
@@ -504,34 +703,61 @@ bool fetchForecast() {
             forecast[i].icon = "";
             forecast[i].pop = 0;
         }
-        
+
         for (JsonObject item : list) {
             if (dayIndex >= 5) break;
-            
+
             time_t dt = item["dt"].as<long>();
             struct tm* timeinfo = localtime(&dt);
-            int currentDay = timeinfo->tm_mday;
-            
-            if (currentDay != lastDay) {
+            if (!timeinfo) continue;
+
+            // Use year + day-of-year so month changes don't collide on same day number
+            int dayKey = ((timeinfo->tm_year + 1900) * 1000) + timeinfo->tm_yday;
+
+            float tMax = item["main"]["temp_max"].as<float>();
+            float tMin = item["main"]["temp_min"].as<float>();
+            String cond = item["weather"][0]["main"].as<String>();
+            String icon = item["weather"][0]["icon"].as<String>();
+            int popPct = (int)(item["pop"].as<float>() * 100.0f + 0.5f);
+
+            if (dayKey != lastDayKey) {
+                // Start a new aggregated day bucket
                 forecast[dayIndex].dt = dt;
-                forecast[dayIndex].tempHigh = item["main"]["temp_max"].as<float>();
-                forecast[dayIndex].tempLow = item["main"]["temp_min"].as<float>();
-                forecast[dayIndex].condition = item["weather"][0]["main"].as<String>();
-                forecast[dayIndex].icon = item["weather"][0]["icon"].as<String>();
-                float popFloat = item["pop"].as<float>();
-                forecast[dayIndex].pop = (int)(popFloat * 100);
-                
-                DisplayLog.printf("Day %d: %s %.0f/%.0f\n", 
-                    dayIndex + 1,
-                    forecast[dayIndex].condition.c_str(),
-                    forecast[dayIndex].tempHigh,
-                    forecast[dayIndex].tempLow);
-                
+                forecast[dayIndex].tempHigh = tMax;
+                forecast[dayIndex].tempLow = tMin;
+                forecast[dayIndex].condition = cond;
+                forecast[dayIndex].icon = icon;
+                forecast[dayIndex].pop = popPct;
+
+                lastDayKey = dayKey;
                 dayIndex++;
-                lastDay = currentDay;
+            } else {
+                // Aggregate min/max across all 3-hour entries for the same calendar day
+                int idx = dayIndex - 1;
+                if (idx < 0 || idx >= 5) continue;
+
+                if (tMax > forecast[idx].tempHigh) forecast[idx].tempHigh = tMax;
+                if (tMin < forecast[idx].tempLow)  forecast[idx].tempLow  = tMin;
+
+                // Keep the "most significant" icon/condition for the day:
+                // prefer the time block with the highest precipitation probability
+                if (popPct >= forecast[idx].pop) {
+                    forecast[idx].pop = popPct;
+                    forecast[idx].condition = cond;
+                    forecast[idx].icon = icon;
+                }
             }
         }
-        
+
+        for (int i = 0; i < dayIndex; i++) {
+            DisplayLog.printf("Day %d: %s %.1f/%.1f  pop=%d%%\n",
+                i + 1,
+                forecast[i].condition.c_str(),
+                forecast[i].tempHigh,
+                forecast[i].tempLow,
+                forecast[i].pop);
+        }
+
         DisplayLog.printf("Forecast: %d days loaded\n", dayIndex);
         http.end();
         return (dayIndex > 0);
@@ -548,6 +774,75 @@ void updateWeather() {
         lastWeatherUpdate = millis();
         updateWeatherUI();
     }
+}
+
+// ============== BOOT COUNTDOWN / OTA OVERLAY HELPERS ==============
+
+void updateContinueCountdownLabel() {
+    if (!continue_countdown_label) return;
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Auto %ds", g_continueCountdownSeconds);
+
+    lvgl_port_lock(-1);
+    lv_label_set_text(continue_countdown_label, buf);
+    if (continue_btn) {
+        lv_obj_align_to(continue_countdown_label, continue_btn, LV_ALIGN_OUT_LEFT_MID, -12, 0);
+    }
+    lvgl_port_unlock();
+}
+
+void beginContinueCountdown() {
+    g_continueCountdownSeconds = 10;
+    g_lastContinueCountdownTick = millis();
+    g_continueCountdownActive = true;
+    updateContinueCountdownLabel();
+
+    lvgl_port_lock(-1);
+    if (continue_countdown_label) {
+        lv_obj_clear_flag(continue_countdown_label, LV_OBJ_FLAG_HIDDEN);
+        if (continue_btn) lv_obj_align_to(continue_countdown_label, continue_btn, LV_ALIGN_OUT_LEFT_MID, -12, 0);
+    }
+    lvgl_port_unlock();
+}
+
+void stopContinueCountdown() {
+    g_continueCountdownActive = false;
+    lvgl_port_lock(-1);
+    if (continue_countdown_label) lv_obj_add_flag(continue_countdown_label, LV_OBJ_FLAG_HIDDEN);
+    lvgl_port_unlock();
+}
+
+void showOTAPrepareMessageScreen() {
+    g_otaDisplayFreeze = true;
+
+    lvgl_port_lock(-1);
+    if (ota_overlay) {
+        lv_obj_move_foreground(ota_overlay);
+        lv_obj_clear_flag(ota_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ota_label) {
+        lv_label_set_text(ota_label, "Firmware Updating...");
+        lv_obj_clear_flag(ota_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ota_sub_label) {
+        lv_label_set_text(ota_sub_label, "Device will reboot upon completion");
+        lv_obj_clear_flag(ota_sub_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    lvgl_port_unlock();
+}
+
+void showOTABlackoutScreen() {
+    g_otaDisplayFreeze = true;
+
+    lvgl_port_lock(-1);
+    if (ota_overlay) {
+        lv_obj_move_foreground(ota_overlay);
+        lv_obj_clear_flag(ota_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ota_label) lv_obj_add_flag(ota_label, LV_OBJ_FLAG_HIDDEN);
+    if (ota_sub_label) lv_obj_add_flag(ota_sub_label, LV_OBJ_FLAG_HIDDEN);
+    lvgl_port_unlock();
 }
 
 // ============== WEB SERVER HTML ==============
@@ -597,10 +892,16 @@ const char update_html[] PROGMEM =
 "document.getElementById('upload-form').onsubmit=function(e){"
 "e.preventDefault();var fd=new FormData(this),cmd=document.querySelector('input[name=cmd]:checked').value;"
 "document.getElementById('progress-container').style.display='block';sb.disabled=true;"
+"document.getElementById('status').textContent='Preparing device screen...';"
+"var prep=new XMLHttpRequest();"
+"prep.onload=function(){if(prep.status!=200){document.getElementById('status').textContent='Prep failed';sb.disabled=false;return;}"
+"document.getElementById('status').textContent='Uploading...';"
 "var xhr=new XMLHttpRequest();"
 "xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);document.getElementById('progress-bar').style.width=p+'%';document.getElementById('status').textContent=p+'%';}};"
-"xhr.onload=function(){document.getElementById('status').textContent=xhr.responseText=='OK'?'SUCCESS! Rebooting...':'FAILED';if(xhr.responseText=='OK')setTimeout(function(){location.href='/';},5000);};"
+"xhr.onload=function(){document.getElementById('status').textContent=xhr.responseText=='OK'?'SUCCESS! Rebooting...':'FAILED';if(xhr.responseText=='OK')setTimeout(function(){location.href='/';},5000);else sb.disabled=false;};"
 "xhr.open('POST','/update?cmd='+cmd);xhr.send(fd);};"
+"prep.onerror=function(){document.getElementById('status').textContent='Prep request failed';sb.disabled=false;};"
+"prep.open('GET','/ota-prep');prep.send();};"
 "</script></body></html>";
 
 const char timezone_html[] PROGMEM = 
@@ -663,6 +964,15 @@ void setupWebServer() {
         server.send_P(200, "text/html", update_html);
     });
     
+    server.on("/ota-prep", HTTP_GET, [](){
+        showOTAPrepareMessageScreen();
+        delay(4000);                 // keep message visible before upload begins
+        showOTABlackoutScreen();     // black screen during OTA upload to avoid flicker
+        otaCutBacklightForUpdate();   // physically blank panel before upload begins
+        g_otaUploadStarted = false;  // set true in actual upload callback
+        server.send(200, "text/plain", "READY");
+    });
+
     server.on("/settings", HTTP_POST, [](){
         if(server.hasArg("timezone")) {
             String tz = server.arg("timezone");
@@ -692,12 +1002,26 @@ void setupWebServer() {
     server.on("/update", HTTP_POST, 
         []() {
             server.sendHeader("Connection", "close");
-            server.send(200, "text/plain", Update.hasError() ? "FAIL" : "OK");
-            g_rebootRequired = true;
+            bool ok = !Update.hasError();
+            server.send(200, "text/plain", ok ? "OK" : "FAIL");
+            if (!ok) {
+                g_otaDisplayFreeze = false;
+                otaRestoreBacklightAfterFailedUpdate();
+                lvgl_port_lock(-1);
+                if (ota_overlay) lv_obj_add_flag(ota_overlay, LV_OBJ_FLAG_HIDDEN);
+                if (ota_label) lv_obj_clear_flag(ota_label, LV_OBJ_FLAG_HIDDEN);
+                if (ota_sub_label) lv_obj_clear_flag(ota_sub_label, LV_OBJ_FLAG_HIDDEN);
+                lvgl_port_unlock();
+            }
+            g_rebootRequired = ok;
         },
         []() {
             HTTPUpload& upload = server.upload();
             if (upload.status == UPLOAD_FILE_START) {
+                g_otaUploadStarted = true;
+                g_otaDisplayFreeze = true;
+                showOTABlackoutScreen();  // ensure black screen stays visible during upload
+                otaCutBacklightForUpdate();   // fallback in case /ota-prep was skipped
                 int cmd = server.arg("cmd") == "100" ? U_SPIFFS : U_FLASH;
                 Update.begin(UPDATE_SIZE_UNKNOWN, cmd);
             } else if (upload.status == UPLOAD_FILE_WRITE) {
@@ -841,6 +1165,23 @@ void backlightOn() {
     }
 }
 
+void otaCutBacklightForUpdate() {
+    g_otaBacklightWasOff = isBacklightOff;
+    if (!isBacklightOff) {
+        backlightOff();
+        g_otaBacklightForcedOff = true;
+    } else {
+        g_otaBacklightForcedOff = false;
+    }
+}
+
+void otaRestoreBacklightAfterFailedUpdate() {
+    if (g_otaBacklightForcedOff && !g_otaBacklightWasOff) {
+        backlightOn();
+    }
+    g_otaBacklightForcedOff = false;
+}
+
 void toggleBacklight() {
     if (isBacklightOff) backlightOn();
     else backlightOff();
@@ -853,16 +1194,20 @@ void showContinueButton() {
         lvgl_port_lock(-1);
         lv_obj_clear_flag(continue_btn, LV_OBJ_FLAG_HIDDEN);
         lvgl_port_unlock();
+        beginContinueCountdown();
     }
 }
 
 void showMainScreen() {
     currentUIState = UI_MAIN;
+    stopContinueCountdown();
+    g_lastRainAnimTick = 0;
     
     lvgl_port_lock(-1);
     
     if (serial_output) lv_obj_add_flag(serial_output, LV_OBJ_FLAG_HIDDEN);
     if (continue_btn) lv_obj_add_flag(continue_btn, LV_OBJ_FLAG_HIDDEN);
+    if (continue_countdown_label) lv_obj_add_flag(continue_countdown_label, LV_OBJ_FLAG_HIDDEN);
     if (weather_container) lv_obj_clear_flag(weather_container, LV_OBJ_FLAG_HIDDEN);
     
     lvgl_port_unlock();
@@ -919,10 +1264,10 @@ void createUI() {
     
     // Serial output (setup screen)
     serial_output = lv_label_create(scr);
-    lv_obj_set_style_text_font(serial_output, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(serial_output, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(serial_output, lv_color_hex(0x00FF00), 0);
     lv_label_set_long_mode(serial_output, LV_LABEL_LONG_WRAP);
-    lv_obj_set_size(serial_output, 780, 380);
+    lv_obj_set_size(serial_output, 780, 350);
     lv_obj_align(serial_output, LV_ALIGN_TOP_LEFT, 10, 40);
     lv_label_set_text(serial_output, "Starting...\n");
     
@@ -939,6 +1284,38 @@ void createUI() {
     lv_obj_add_event_cb(continue_btn, [](lv_event_t * e) {
         if (lv_event_get_code(e) == LV_EVENT_CLICKED) showMainScreen();
     }, LV_EVENT_CLICKED, NULL);
+
+    // Countdown label (auto-continue after 10s if not touched)
+    continue_countdown_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(continue_countdown_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(continue_countdown_label, lv_color_hex(0xFFAA00), 0);
+    lv_label_set_text(continue_countdown_label, "Auto 10s");
+    lv_obj_align_to(continue_countdown_label, continue_btn, LV_ALIGN_OUT_LEFT_MID, -12, 0);
+    lv_obj_add_flag(continue_countdown_label, LV_OBJ_FLAG_HIDDEN);
+
+    // Full-screen OTA overlay (blackout + centered status text)
+    ota_overlay = lv_obj_create(scr);
+    lv_obj_set_size(ota_overlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(ota_overlay, 0, 0);
+    lv_obj_set_style_bg_color(ota_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ota_overlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(ota_overlay, 0, 0);
+    lv_obj_clear_flag(ota_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ota_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    ota_label = lv_label_create(ota_overlay);
+    lv_obj_set_style_text_font(ota_label, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(ota_label, lv_color_hex(0xFF8800), 0);
+    lv_obj_set_style_text_align(ota_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(ota_label, "Firmware Updating...");
+    lv_obj_align(ota_label, LV_ALIGN_CENTER, 0, -18);
+
+    ota_sub_label = lv_label_create(ota_overlay);
+    lv_obj_set_style_text_font(ota_sub_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(ota_sub_label, lv_color_hex(0xFFAA33), 0);
+    lv_obj_set_style_text_align(ota_sub_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(ota_sub_label, "Device will reboot upon completion");
+    lv_obj_align(ota_sub_label, LV_ALIGN_CENTER, 0, 18);
 }
 
 // ============== CREATE WEATHER UI (FULL SCREEN) ==============
@@ -948,23 +1325,37 @@ void createWeatherUI() {
     
     // Weather container - full screen below header
     weather_container = lv_obj_create(scr);
-    lv_obj_set_size(weather_container, 800, 440);
-    lv_obj_align(weather_container, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    // Use the full screen height (minus the top header row) — no reserved footer area on Weather screen
+    lv_disp_t *disp = lv_disp_get_default();
+    int scrW = (int)lv_disp_get_hor_res(disp);
+    int scrH = (int)lv_disp_get_ver_res(disp);
+    const int HEADER_H = 40;
+
+    lv_obj_set_size(weather_container, scrW, scrH - HEADER_H);
+    lv_obj_set_pos(weather_container, 0, HEADER_H);
+
     lv_obj_set_style_bg_color(weather_container, lv_color_hex(0x0a0a1a), 0);
     lv_obj_set_style_border_width(weather_container, 0, 0);
-    lv_obj_set_style_pad_all(weather_container, 5, 0);
-    lv_obj_add_flag(weather_container, LV_OBJ_FLAG_HIDDEN);
+
+    // Keep a small margin on left/right/top, but let content go to the bottom edge
+    lv_obj_set_style_pad_left(weather_container, 5, 0);
+    lv_obj_set_style_pad_right(weather_container, 5, 0);
+    lv_obj_set_style_pad_top(weather_container, 5, 0);
+    lv_obj_set_style_pad_bottom(weather_container, 0, 0);
+lv_obj_add_flag(weather_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(weather_container, LV_OBJ_FLAG_SCROLLABLE);
     
     // ===== LEFT SECTION: Current Weather Icon =====
-    main_icon_label = lv_label_create(weather_container);
-    lv_obj_set_style_text_font(main_icon_label, &lv_font_montserrat_44, 0);
-    lv_obj_set_style_text_color(main_icon_label, lv_color_hex(0xFFD700), 0);
-    lv_obj_set_style_text_align(main_icon_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_size(main_icon_label, 150, 100);
-    lv_obj_set_pos(main_icon_label, 20, 30);
-    lv_label_set_text(main_icon_label, "---");
-    
+    main_icon_img = lv_img_create(weather_container);
+    lv_img_set_src(main_icon_img, &sunny);  // placeholder until first update
+    lv_obj_set_pos(main_icon_img, 35, 15);
+    lv_img_set_zoom(main_icon_img, MAIN_ICON_ZOOM);
+
+    // Animated rain overlay for main icon (80x80 icon region)
+    createRainOverlay(weather_container, &main_rain_overlay, main_rain_drops, MAIN_RAIN_DROP_COUNT, 80, 80, 3);
+    lv_obj_set_pos(main_rain_overlay, 35, 15);
+
     // ===== CENTER SECTION: Temperature & Details =====
     
     // Large temperature
@@ -1028,15 +1419,24 @@ void createWeatherUI() {
     // ===== BOTTOM SECTION: 5-Day Forecast =====
     
     int panelWidth = 145;
-    int panelHeight = 200;
     int panelSpacing = 155;
     int startX = 15;
     int startY = 170;
+
+    // Make forecast panels reach the bottom of the weather container (including any area
+    // that was previously reserved for a footer on other screens)
+    int containerH = lv_obj_get_height(weather_container);
+    int padTop = (int)lv_obj_get_style_pad_top(weather_container, LV_PART_MAIN);
+    int padBottom = (int)lv_obj_get_style_pad_bottom(weather_container, LV_PART_MAIN);
+    int contentH = containerH - padTop - padBottom;
+
+    int panelHeight = contentH - startY;   // go all the way down
+    if (panelHeight < 200) panelHeight = 200;
     
     for (int i = 0; i < 5; i++) {
         // Panel background
         lv_obj_t *panel = lv_obj_create(weather_container);
-        lv_obj_set_size(panel, panelWidth, panelHeight);
+        lv_obj_set_size(panel, panelWidth, panelHeight + 40);
         lv_obj_set_pos(panel, startX + (i * panelSpacing), startY);
         lv_obj_set_style_bg_color(panel, lv_color_hex(0x1a1a2e), 0);
         lv_obj_set_style_border_color(panel, lv_color_hex(0x333355), 0);
@@ -1053,20 +1453,22 @@ void createWeatherUI() {
         lv_label_set_text(day_lbl, "---");
         forecast_day_labels[i] = day_lbl;
         
-        // Weather icon/text
-        lv_obj_t *icon_lbl = lv_label_create(panel);
-        lv_obj_set_style_text_font(icon_lbl, &lv_font_montserrat_24, 0);
-        lv_obj_set_style_text_color(icon_lbl, lv_color_hex(0xFFD700), 0);
-        lv_obj_set_style_text_align(icon_lbl, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(icon_lbl, LV_ALIGN_TOP_MID, 0, 35);
-        lv_label_set_text(icon_lbl, "---");
-        forecast_icon_labels[i] = icon_lbl;
-        
+        // Weather icon
+        lv_obj_t *icon_img = lv_img_create(panel);
+        lv_img_set_src(icon_img, &cloudy);  // placeholder
+        lv_obj_align(icon_img, LV_ALIGN_TOP_MID, 0, 30);
+        lv_img_set_zoom(icon_img, FORECAST_ICON_ZOOM);
+        forecast_icon_imgs[i] = icon_img;
+
+        // Animated rain overlay over the scaled forecast icon (~60x60 visual area)
+        createRainOverlay(panel, &forecast_rain_overlays[i], forecast_rain_drops[i], FORECAST_RAIN_DROP_COUNT, 60, 60, 2);
+        lv_obj_set_pos(forecast_rain_overlays[i], (panelWidth - 60) / 2, 40);
+
         // High temp
         lv_obj_t *high_lbl = lv_label_create(panel);
         lv_obj_set_style_text_font(high_lbl, &lv_font_montserrat_24, 0);
         lv_obj_set_style_text_color(high_lbl, lv_color_hex(0xFF6666), 0);
-        lv_obj_align(high_lbl, LV_ALIGN_CENTER, 0, 15);
+        lv_obj_align(high_lbl, LV_ALIGN_TOP_MID, 0, 110);
         lv_label_set_text(high_lbl, "--°");
         forecast_high_labels[i] = high_lbl;
         
@@ -1074,7 +1476,7 @@ void createWeatherUI() {
         lv_obj_t *low_lbl = lv_label_create(panel);
         lv_obj_set_style_text_font(low_lbl, &lv_font_montserrat_24, 0);
         lv_obj_set_style_text_color(low_lbl, lv_color_hex(0x6699FF), 0);
-        lv_obj_align(low_lbl, LV_ALIGN_CENTER, 0, 45);
+        lv_obj_align(low_lbl, LV_ALIGN_TOP_MID, 0, 140);
         lv_label_set_text(low_lbl, "--°");
         forecast_low_labels[i] = low_lbl;
         
@@ -1082,7 +1484,7 @@ void createWeatherUI() {
         lv_obj_t *pop_lbl = lv_label_create(panel);
         lv_obj_set_style_text_font(pop_lbl, &lv_font_montserrat_24, 0);
         lv_obj_set_style_text_color(pop_lbl, lv_color_hex(0x66CCFF), 0);
-        lv_obj_align(pop_lbl, LV_ALIGN_BOTTOM_MID, 0, 10);
+        lv_obj_align(pop_lbl, LV_ALIGN_TOP_MID, 0, 170);
         lv_label_set_text(pop_lbl, "-- %");
         forecast_pop_labels[i] = pop_lbl;
     }
@@ -1099,10 +1501,14 @@ void updateWeatherUI() {
     const char* speedUnit = useMetricUnits ? "m/s" : "mph";
     char buf[64];
     
-    // Update main weather icon color based on condition
-    uint32_t iconColor = getWeatherColor(currentWeather.icon);
-    lv_obj_set_style_text_color(main_icon_label, lv_color_hex(iconColor), 0);
-    lv_label_set_text(main_icon_label, getWeatherIconText(currentWeather.icon));
+    // Update main weather icon image
+    const lv_img_dsc_t *mainIcon = getWeatherIconDsc(currentWeather.icon);
+    if (main_icon_img && mainIcon) {
+        lv_img_set_src(main_icon_img, mainIcon);
+        lv_obj_clear_flag(main_icon_img, LV_OBJ_FLAG_HIDDEN);
+    } else if (main_icon_img) {
+        lv_obj_add_flag(main_icon_img, LV_OBJ_FLAG_HIDDEN);
+    }
     
     // Temperature
     snprintf(buf, sizeof(buf), "%.0f°%s", currentWeather.temperature, unit);
@@ -1143,41 +1549,57 @@ void updateWeatherUI() {
     for (int i = 0; i < 5; i++) {
         if (forecast[i].dt == 0) {
             lv_label_set_text(forecast_day_labels[i], "---");
-            lv_label_set_text(forecast_icon_labels[i], "---");
+            if (forecast_icon_imgs[i]) lv_obj_add_flag(forecast_icon_imgs[i], LV_OBJ_FLAG_HIDDEN);
             lv_label_set_text(forecast_high_labels[i], "--°");
             lv_label_set_text(forecast_low_labels[i], "--°");
             lv_label_set_text(forecast_pop_labels[i], "-- %");
+            if (forecast_rain_overlays[i]) lv_obj_add_flag(forecast_rain_overlays[i], LV_OBJ_FLAG_HIDDEN);
         } else {
             struct tm* fc_time = localtime(&forecast[i].dt);
             
             // Day name
             lv_label_set_text(forecast_day_labels[i], dayNames[fc_time->tm_wday]);
             
-            // Weather icon with color
-            uint32_t fIconColor = getWeatherColor(forecast[i].icon);
-            lv_obj_set_style_text_color(forecast_icon_labels[i], lv_color_hex(fIconColor), 0);
-            lv_label_set_text(forecast_icon_labels[i], getWeatherShortText(forecast[i].icon));
+            // Weather icon image
+            const lv_img_dsc_t *fIcon = getWeatherIconDsc(forecast[i].icon);
+            if (forecast_icon_imgs[i] && fIcon) {
+                lv_img_set_src(forecast_icon_imgs[i], fIcon);
+                lv_obj_clear_flag(forecast_icon_imgs[i], LV_OBJ_FLAG_HIDDEN);
+            } else if (forecast_icon_imgs[i]) {
+                lv_obj_add_flag(forecast_icon_imgs[i], LV_OBJ_FLAG_HIDDEN);
+            }
             
-            // High temp
-            snprintf(buf, sizeof(buf), "%.0f°", forecast[i].tempHigh);
+            // High/Low temp (avoid same displayed integer when raw values differ but rounding collapses them)
+            int highDisp = (int)lroundf(forecast[i].tempHigh);
+            int lowDisp = (int)lroundf(forecast[i].tempLow);
+            if (highDisp == lowDisp && (forecast[i].tempHigh - forecast[i].tempLow) > 0.01f) {
+                highDisp = (int)ceilf(forecast[i].tempHigh);
+                lowDisp = (int)floorf(forecast[i].tempLow);
+            }
+
+            snprintf(buf, sizeof(buf), "%d°", highDisp);
             lv_label_set_text(forecast_high_labels[i], buf);
-            
-            // Low temp
-            snprintf(buf, sizeof(buf), "%.0f°", forecast[i].tempLow);
+
+            snprintf(buf, sizeof(buf), "%d°", lowDisp);
             lv_label_set_text(forecast_low_labels[i], buf);
-            
+
             // Precipitation
             snprintf(buf, sizeof(buf), "%d%%", forecast[i].pop);
             lv_label_set_text(forecast_pop_labels[i], buf);
         }
     }
-    
+
+    // Refresh rain overlay visibility and advance one frame immediately after new data/icons arrive
+    refreshRainAnimationVisibilityLocked();
+    updateRainAnimationFrameLocked();
+
     lvgl_port_unlock();
 }
 
 // ============== UPDATE CLOCK ==============
 
 void updateClock() {
+    if (g_otaDisplayFreeze) return;
     struct tm timeinfo;
     if (getLocalTime(&timeinfo)) {
         char timeStr[16];
@@ -1296,13 +1718,29 @@ void loop()
     }
     
     unsigned long currentMillis = millis();
-    
-    if (currentMillis - lastUpdate >= UPDATE_INTERVAL_MS) {
+    tickRainAnimation(currentMillis);
+
+    // Boot screen auto-continue countdown (10s) if button is not pressed
+    if (g_continueCountdownActive && currentUIState == UI_SETUP && !g_otaDisplayFreeze) {
+        if (currentMillis - g_lastContinueCountdownTick >= 1000) {
+            g_lastContinueCountdownTick += 1000;
+            if (g_continueCountdownSeconds > 0) {
+                g_continueCountdownSeconds--;
+                updateContinueCountdownLabel();
+            }
+            if (g_continueCountdownSeconds <= 0) {
+                stopContinueCountdown();
+                showMainScreen();
+            }
+        }
+    }
+
+    if (!g_otaDisplayFreeze && (currentMillis - lastUpdate >= UPDATE_INTERVAL_MS)) {
         lastUpdate = currentMillis;
         updateClock();
     }
-    
-    if (currentUIState == UI_MAIN && weatherApiKey.length() > 0) {
+
+    if (!g_otaDisplayFreeze && currentUIState == UI_MAIN && weatherApiKey.length() > 0) {
         if (currentMillis - lastWeatherUpdate >= WEATHER_UPDATE_INTERVAL_MS) {
             updateWeather();
         }
