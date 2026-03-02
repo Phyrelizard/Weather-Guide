@@ -1,8 +1,14 @@
 #include <Arduino.h>
 #include <math.h>
 // Firmware version
-#define FIRMWARE_VERSION "v2.2.3"
-/**
+#define FIRMWARE_VERSION "v2.3.2"
+/** * Changelog:
+ *  v2.3.2 - address http -11 error and 5th day forecast showing up with high and low temps the same.
+ *  v2.3.1 - Minor bug fixes and improvements - fixed occasional reboots when backlight 
+ *  turns on after PIR trigger, added more debug logging around PIR state changes
+ * 
+ *  v2.3.0 - Added SR602 PIR module to gopio06 for motion detection for backlight control
+ * 
  *  v2.2.3 - rain animation drop overlays auto-center to rain icon width (works better with smaller rain.c assets)
  *  v2.2.2 - OTA update prep now turns backlight OFF after splash/blackout to eliminate visible flicker during upload
  *  v2.2.1 - animated rain icon overlays + forecast daily high/low aggregation fix
@@ -41,6 +47,7 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
+#include "driver/gpio.h"
 
 // Weather icons (LVGL C-array images)
 #include "weather_icons.h"
@@ -157,6 +164,22 @@ static unsigned long g_lastRainAnimTick = 0;
 // Rain drop alignment nudges (fine tune if you swap icon art again)
 static const int MAIN_RAIN_DROP_X_NUDGE = -18; //prev was -4
 static const int FORECAST_RAIN_DROP_X_NUDGE = -18; //was -6
+
+static constexpr gpio_num_t PIR_GPIO = GPIO_NUM_6;
+static constexpr unsigned long PIR_HOLD_MS = 15000;
+static constexpr unsigned long PIR_DEBOUNCE_MS = 50;      // debounce chatter
+static constexpr unsigned long PIR_BOOT_IGNORE_MS = 2000; // ignore PIR right after boot
+
+static unsigned long pirLastRawChangeMs = 0;
+static int pirRawLast = 0;
+static int pirStable = 0;
+
+static unsigned long pirLastHighMs = 0;
+static bool pirKeepingBacklightOn = false;
+static unsigned long pirBootMs = 0;
+
+static constexpr unsigned long BACKLIGHT_TOGGLE_GUARD_MS = 1500;
+static unsigned long backlightLastToggleMs = 0;
 
 // UI state
 enum UIState {
@@ -574,12 +597,17 @@ void updateWeatherUI();
 void updateContinueCountdownLabel();
 void beginContinueCountdown();
 void stopContinueCountdown();
+
 void showOTAPrepareMessageScreen();
 void showOTABlackoutScreen();
 void backlightOff();
 void backlightOn();
 void otaCutBacklightForUpdate();
 void otaRestoreBacklightAfterFailedUpdate();
+void initPirInput();
+void updatePirBacklightControl(unsigned long nowMs);
+
+
 bool isRainIconCode(const String& iconCode);
 void createRainOverlay(lv_obj_t* parent, lv_obj_t** overlayOut, lv_obj_t** drops, int dropCount, uint16_t w, uint16_t h, uint8_t lineWidth);
 void refreshRainAnimationVisibilityLocked();
@@ -675,8 +703,17 @@ bool fetchForecast() {
     DisplayLog.println("Fetching forecast...");
 
     http.begin(client, url);
-    http.setTimeout(15000);
+    http.setTimeout(20000);
+
     int httpCode = http.GET();
+    if (httpCode == -11) {                 // retry once on timeout
+        DisplayLog.println("Forecast timeout (-11), retrying once...");
+        delay(250);
+        http.end();
+        http.begin(client, url);
+        http.setTimeout(20000);
+        httpCode = http.GET();
+    }
 
     if (httpCode == HTTP_CODE_OK) {
         String payload = http.getString();
@@ -691,10 +728,26 @@ bool fetchForecast() {
         }
 
         JsonArray list = doc["list"].as<JsonArray>();
+        if (list.isNull() || list.size() == 0) {
+            DisplayLog.println("Forecast: empty list");
+            http.end();
+            return false;
+        }
+
         int dayIndex = 0;
         int lastDayKey = -1;
 
-        // Initialize forecast array
+        // Determine "today" key from first entry local date,
+        // then SKIP that partial day to avoid fake Day-5 equal high/low.
+        time_t firstDt = list[0]["dt"].as<long>();
+        struct tm* firstTm = localtime(&firstDt);
+        int firstDayKey = firstTm
+            ? (((firstTm->tm_year + 1900) * 1000) + firstTm->tm_yday)
+            : -1;
+
+        // point counter per bucket so you can see if a day had only one sample
+        int pointsPerDay[5] = {0, 0, 0, 0, 0};
+
         for (int i = 0; i < 5; i++) {
             forecast[i].dt = 0;
             forecast[i].tempHigh = 0;
@@ -711,8 +764,10 @@ bool fetchForecast() {
             struct tm* timeinfo = localtime(&dt);
             if (!timeinfo) continue;
 
-            // Use year + day-of-year so month changes don't collide on same day number
             int dayKey = ((timeinfo->tm_year + 1900) * 1000) + timeinfo->tm_yday;
+
+            // Skip current/partial day
+            //if (dayKey == firstDayKey) continue;
 
             float tMax = item["main"]["temp_max"].as<float>();
             float tMin = item["main"]["temp_min"].as<float>();
@@ -721,7 +776,6 @@ bool fetchForecast() {
             int popPct = (int)(item["pop"].as<float>() * 100.0f + 0.5f);
 
             if (dayKey != lastDayKey) {
-                // Start a new aggregated day bucket
                 forecast[dayIndex].dt = dt;
                 forecast[dayIndex].tempHigh = tMax;
                 forecast[dayIndex].tempLow = tMin;
@@ -729,33 +783,36 @@ bool fetchForecast() {
                 forecast[dayIndex].icon = icon;
                 forecast[dayIndex].pop = popPct;
 
+                pointsPerDay[dayIndex] = 1;
                 lastDayKey = dayKey;
                 dayIndex++;
             } else {
-                // Aggregate min/max across all 3-hour entries for the same calendar day
                 int idx = dayIndex - 1;
                 if (idx < 0 || idx >= 5) continue;
 
                 if (tMax > forecast[idx].tempHigh) forecast[idx].tempHigh = tMax;
                 if (tMin < forecast[idx].tempLow)  forecast[idx].tempLow  = tMin;
 
-                // Keep the "most significant" icon/condition for the day:
-                // prefer the time block with the highest precipitation probability
                 if (popPct >= forecast[idx].pop) {
                     forecast[idx].pop = popPct;
                     forecast[idx].condition = cond;
                     forecast[idx].icon = icon;
                 }
+
+                pointsPerDay[idx]++;
             }
         }
 
         for (int i = 0; i < dayIndex; i++) {
-            DisplayLog.printf("Day %d: %s %.1f/%.1f  pop=%d%%\n",
-                i + 1,
-                forecast[i].condition.c_str(),
-                forecast[i].tempHigh,
-                forecast[i].tempLow,
-                forecast[i].pop);
+        const char* partialTag = (pointsPerDay[i] < 8) ? " (partial)" : "";
+        DisplayLog.printf("Day %d%s: %s %.1f/%.1f  pop=%d%%  points=%d\n",
+        i + 1,
+        partialTag,
+        forecast[i].condition.c_str(),
+        forecast[i].tempHigh,
+        forecast[i].tempLow,
+        forecast[i].pop,
+        pointsPerDay[i]);
         }
 
         DisplayLog.printf("Forecast: %d days loaded\n", dayIndex);
@@ -1152,16 +1209,75 @@ void initTime() {
 // ============== BACKLIGHT ==============
 
 void backlightOff() {
-    if (expander) {
+    unsigned long now = millis();
+    if (now - backlightLastToggleMs < BACKLIGHT_TOGGLE_GUARD_MS) return;
+
+    if (expander && !isBacklightOff) {
         expander->digitalWrite(LCD_BL, LOW);
         isBacklightOff = true;
+        backlightLastToggleMs = now;
+    }
+}
+
+void initPirInput() {
+    gpio_config_t cfg = {};
+    cfg.pin_bit_mask = (1ULL << PIR_GPIO);
+    cfg.mode = GPIO_MODE_INPUT;
+    cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    cfg.pull_down_en = GPIO_PULLDOWN_ENABLE; // PIR output is active HIGH, so pull down to ensure LOW when idle
+    cfg.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&cfg);
+
+    pirBootMs = millis();
+    pirRawLast = gpio_get_level(PIR_GPIO);
+    pirStable = pirRawLast;
+    pirLastRawChangeMs = pirBootMs;
+    pirLastHighMs = pirBootMs;
+}
+
+void updatePirBacklightControl(unsigned long nowMs) {
+    // Ignore PIR during early boot settling
+    if (nowMs - pirBootMs < PIR_BOOT_IGNORE_MS) {
+        return;
+    }
+
+    int raw = gpio_get_level(PIR_GPIO);
+
+    // Track raw transitions
+    if (raw != pirRawLast) {
+        pirRawLast = raw;
+        pirLastRawChangeMs = nowMs;
+    }
+
+    // Debounce: accept new stable state only after PIR_DEBOUNCE_MS
+    if ((nowMs - pirLastRawChangeMs) >= PIR_DEBOUNCE_MS) {
+        pirStable = pirRawLast;
+    }
+
+    if (pirStable == 1) {
+        pirLastHighMs = nowMs;
+        if (!pirKeepingBacklightOn) {
+            backlightOn();                 // one-shot write only on edge
+            pirKeepingBacklightOn = true;
+        }
+        return;
+    }
+
+    // stable LOW: hold for PIR_HOLD_MS, then turn off once
+    if (pirKeepingBacklightOn && (nowMs - pirLastHighMs >= PIR_HOLD_MS)) {
+        backlightOff();                    // one-shot write only on edge
+        pirKeepingBacklightOn = false;
     }
 }
 
 void backlightOn() {
-    if (expander) {
+    unsigned long now = millis();
+    if (now - backlightLastToggleMs < BACKLIGHT_TOGGLE_GUARD_MS) return;
+
+    if (expander && isBacklightOff) {
         expander->digitalWrite(LCD_BL, HIGH);
         isBacklightOff = false;
+        backlightLastToggleMs = now;
     }
 }
 
@@ -1681,6 +1797,8 @@ void setup()
     delay(100);
     expander->digitalWrite(LCD_BL, HIGH);
 
+    initPirInput();
+
     lvgl_mux = xSemaphoreCreateRecursiveMutex();
     xTaskCreate(lvgl_port_task, "lvgl", LVGL_TASK_STACK_SIZE, NULL, LVGL_TASK_PRIORITY, NULL);
 
@@ -1717,8 +1835,9 @@ void loop()
         ESP.restart();
     }
     
-    unsigned long currentMillis = millis();
-    tickRainAnimation(currentMillis);
+unsigned long currentMillis = millis();
+tickRainAnimation(currentMillis);
+updatePirBacklightControl(currentMillis);
 
     // Boot screen auto-continue countdown (10s) if button is not pressed
     if (g_continueCountdownActive && currentUIState == UI_SETUP && !g_otaDisplayFreeze) {
